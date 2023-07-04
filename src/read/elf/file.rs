@@ -71,6 +71,36 @@ where
         })
     }
 
+    /// Parse a loaded ELFs data.
+    pub fn parse_loaded(data: R) -> read::Result<Self> {
+        let header = Elf::parse(data)?;
+        let endian = header.endian()?;
+        let segments = header.program_headers(endian, data)?;
+
+        // No sections in loaded elf, thus we'll create an empty section table.
+        let sections = SectionTable::new(Default::default(), Default::default());
+
+        // No symbols in loaded elf, thus we'll create an empty symbol table.
+        let symbols: SymbolTable<'data, Elf, R> = Default::default();
+
+        // TODO: get dynamic symbols from DT_SYMTAB
+        let dynamic_symbols = sections.symbols(endian, data, elf::SHT_DYNSYM)?;
+
+        // The API we provide requires a mapping from section to relocations, so build it now.
+        let relocations = sections.relocation_sections(endian, symbols.section())?;
+
+        Ok(ElfFile {
+            endian,
+            data,
+            header,
+            segments,
+            sections,
+            relocations,
+            symbols,
+            dynamic_symbols,
+        })
+    }
+
     /// Returns the endianness.
     pub fn endian(&self) -> Elf::Endian {
         self.endian

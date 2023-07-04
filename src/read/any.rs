@@ -270,6 +270,20 @@ impl<'data, R: ReadRef<'data>> File<'data, R> {
         Ok(File { inner })
     }
 
+    /// Parse the raw file data.
+    pub fn parse_loaded(data: R) -> Result<Self> {
+        let inner = match FileKind::parse(data)? {
+            #[cfg(feature = "elf")]
+            FileKind::Elf32 => FileInternal::Elf32(elf::ElfFile32::parse_loaded(data)?),
+            #[cfg(feature = "elf")]
+            FileKind::Elf64 => FileInternal::Elf64(elf::ElfFile64::parse_loaded(data)?),
+            #[allow(unreachable_patterns)]
+            // TODO: should I forward this to the regular parse, or return error?
+            _ => Self::parse(data)?.inner,
+        };
+        Ok(File { inner })
+    }
+
     /// Parse a Mach-O image from the dyld shared cache.
     #[cfg(feature = "macho")]
     pub fn parse_dyld_cache_image<'cache, E: Endian>(
