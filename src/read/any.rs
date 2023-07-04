@@ -271,12 +271,12 @@ impl<'data, R: ReadRef<'data>> File<'data, R> {
     }
 
     /// Parse the raw file data.
-    pub fn parse_loaded(data: R) -> Result<Self> {
+    pub fn parse_loaded(data: R, base: usize) -> Result<Self> {
         let inner = match FileKind::parse(data)? {
             #[cfg(feature = "elf")]
-            FileKind::Elf32 => FileInternal::Elf32(elf::ElfFile32::parse_loaded(data)?),
+            FileKind::Elf32 => FileInternal::Elf32(elf::ElfFile32::parse_loaded(data, base)?),
             #[cfg(feature = "elf")]
-            FileKind::Elf64 => FileInternal::Elf64(elf::ElfFile64::parse_loaded(data)?),
+            FileKind::Elf64 => FileInternal::Elf64(elf::ElfFile64::parse_loaded(data, base)?),
             #[allow(unreachable_patterns)]
             // TODO: should I forward this to the regular parse, or return error?
             _ => Self::parse(data)?.inner,

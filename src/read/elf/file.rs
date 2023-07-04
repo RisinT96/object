@@ -3,6 +3,10 @@ use core::convert::TryInto;
 use core::fmt::Debug;
 use core::mem;
 
+use crate::elf::{
+    DT_JMPREL, DT_PLTREL, DT_PLTRELSZ, DT_REL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_RELENT, DT_RELSZ,
+    DT_STRSZ, DT_STRTAB, DT_SYMTAB, PT_DYNAMIC,
+};
 use crate::read::{
     self, util, Architecture, ByteString, Bytes, Error, Export, FileFlags, Import, Object,
     ObjectKind, ReadError, ReadRef, SectionIndex, StringTable, SymbolIndex,
@@ -10,10 +14,10 @@ use crate::read::{
 use crate::{elf, endian, Endian, Endianness, Pod, U32};
 
 use super::{
-    CompressionHeader, Dyn, ElfComdat, ElfComdatIterator, ElfDynamicRelocationIterator, ElfSection,
-    ElfSectionIterator, ElfSegment, ElfSegmentIterator, ElfSymbol, ElfSymbolIterator,
-    ElfSymbolTable, NoteHeader, ProgramHeader, Rel, Rela, RelocationSections, SectionHeader,
-    SectionTable, Sym, SymbolTable,
+    CompressionHeader, Dyn, ElfComdat, ElfComdatIterator, ElfDynamicRelocationIterator,
+    ElfRelaIterator, ElfSection, ElfSectionIterator, ElfSegment, ElfSegmentIterator, ElfSymbol,
+    ElfSymbolIterator, ElfSymbolTable, NoteHeader, ProgramHeader, Rel, Rela, RelocationSections,
+    SectionHeader, SectionTable, Sym, SymbolTable,
 };
 
 /// A 32-bit ELF object file.
@@ -72,10 +76,10 @@ where
     }
 
     /// Parse a loaded ELFs data.
-    pub fn parse_loaded(data: R) -> read::Result<Self> {
+    pub fn parse_loaded(data: R, base: usize) -> read::Result<Self> {
         let header = Elf::parse(data)?;
         let endian = header.endian()?;
-        let segments = header.program_headers(endian, data)?;
+        let program_headers = header.program_headers(endian, data)?;
 
         // No sections in loaded elf, thus we'll create an empty section table.
         let sections = SectionTable::new(Default::default(), Default::default());
@@ -83,17 +87,125 @@ where
         // No symbols in loaded elf, thus we'll create an empty symbol table.
         let symbols: SymbolTable<'data, Elf, R> = Default::default();
 
+        // Create an empty list of relocations from the empty sections and symbols.
+        let relocations = sections.relocation_sections(endian, symbols.section())?;
+
+        let dynamic = Self::loaded_get_dynamic_section(data, program_headers, endian)?
+            .ok_or(Error("No dynamic section available!"))?;
+
+        let pltrel = Self::find_dyn_by_tag(dynamic, DT_PLTREL, endian)
+            .ok_or(Error("No pltrel! Can't determine between RELA and REL"))?
+            .into() as u32;
+
+        let (dt_relsz, dt_relent) = match pltrel {
+            DT_REL => (DT_RELSZ, DT_RELENT),
+            DT_RELA => (DT_RELASZ, DT_RELAENT),
+            _ => todo!(),
+        };
+
+        let dynamic_relocations_address = Self::find_dyn_by_tag(dynamic, pltrel, endian)
+            .ok_or(Error("Can't rela_dyn section!"))?
+            .into() as usize;
+        let dynamic_relocations_offset = dynamic_relocations_address - base;
+
+        // Unwrap safety: according to the ELF manual, if DT_REL or DT_RELA exist, then DT_RELSZ and DT_RELENT or
+        // DT_RELASZ and DT_RELAENT (accordingly) *MUST* exist.
+        let dynamic_relocations_size = Self::find_dyn_by_tag(dynamic, dt_relsz, endian)
+            .unwrap()
+            .into();
+        let dynamic_relocation_entry_size = Self::find_dyn_by_tag(dynamic, dt_relent, endian)
+            .unwrap()
+            .into();
+
+        let dynamic_plt_relocations_address = Self::find_dyn_by_tag(dynamic, DT_JMPREL, endian)
+            .ok_or(Error("Can't rela_dyn section!"))?
+            .into() as usize;
+        let dynamic_plt_relocations_offset = dynamic_plt_relocations_address - base;
+
+        // Unwrap safety: according to the ELF manual, if DT_JMPREL exists, then DT_PLTRELSZ *MUST* exist.
+        let dynamic_plt_relocations_size = Self::find_dyn_by_tag(dynamic, DT_PLTRELSZ, endian)
+            .unwrap()
+            .into();
+
+        let dynamic_relocations = match pltrel {
+            DT_REL => ElfRelaIterator::<Elf>::Rel(
+                data.read_slice_at(
+                    dynamic_relocations_offset as u64,
+                    dynamic_relocations_size as usize / dynamic_relocation_entry_size as usize,
+                )
+                .read_error("Failed to parse dynamic relocations")?
+                .iter(),
+            ),
+            DT_RELA => ElfRelaIterator::<Elf>::Rela(
+                data.read_slice_at(
+                    dynamic_relocations_offset as u64,
+                    dynamic_relocations_size as usize / dynamic_relocation_entry_size as usize,
+                )
+                .read_error("Failed to parse dynamic relocations")?
+                .iter(),
+            ),
+            _ => return Err(Error("Unexpected DT_PLTREL value!")),
+        };
+
+        let dynamic_plt_relocations = match pltrel {
+            DT_REL => ElfRelaIterator::<Elf>::Rel(
+                data.read_slice_at(
+                    dynamic_plt_relocations_offset as u64,
+                    dynamic_plt_relocations_size as usize / dynamic_relocation_entry_size as usize,
+                )
+                .read_error("Failed to parse dynamic relocations")?
+                .iter(),
+            ),
+            DT_RELA => ElfRelaIterator::<Elf>::Rela(
+                data.read_slice_at(
+                    dynamic_plt_relocations_offset as u64,
+                    dynamic_plt_relocations_size as usize / dynamic_relocation_entry_size as usize,
+                )
+                .read_error("Failed to parse dynamic relocations")?
+                .iter(),
+            ),
+            _ => return Err(Error("Unexpected DT_PLTREL value!")),
+        };
+
+        let all_relocations = dynamic_relocations.chain(dynamic_plt_relocations);
+
+        let dynamic_symbols_address = Self::find_dyn_by_tag(dynamic, DT_SYMTAB, endian)
+            .ok_or(Error("Can't rela_dyn section!"))?
+            .into() as usize;
+        let dynamic_symbols_offset = dynamic_symbols_address - base;
+        let dynamic_symbols_amount = all_relocations
+            .filter(|r| r.r_sym(endian, false) != 0)
+            .map(|r| r.r_sym(endian, false))
+            .max()
+            .unwrap_or(0);
+        let dynamic_symbols: &[Elf::Sym] = data
+            .read_slice_at(
+                dynamic_symbols_offset as u64,
+                dynamic_symbols_amount as usize,
+            )
+            .read_error("Failed to parse dynamic relocations")?;
+
+        let dynamic_strings_address = Self::find_dyn_by_tag(dynamic, DT_STRTAB, endian)
+            .ok_or(Error("Can't rela_dyn section!"))?
+            .into() as usize;
+        let dynamic_strings_offset = dynamic_strings_address - base;
+        let dynamic_strings_size = Self::find_dyn_by_tag(dynamic, DT_STRSZ, endian)
+            .ok_or(Error("Can't rela_dyn section!"))?
+            .into() as usize;
+        let dynamic_strings = StringTable::new(
+            data,
+            dynamic_strings_offset as u64,
+            (dynamic_strings_offset + dynamic_strings_size) as u64,
+        );
+
         // TODO: get dynamic symbols from DT_SYMTAB
         let dynamic_symbols = sections.symbols(endian, data, elf::SHT_DYNSYM)?;
-
-        // The API we provide requires a mapping from section to relocations, so build it now.
-        let relocations = sections.relocation_sections(endian, symbols.section())?;
 
         Ok(ElfFile {
             endian,
             data,
             header,
-            segments,
+            segments: program_headers,
             sections,
             relocations,
             symbols,
@@ -154,6 +266,44 @@ where
         _section_name: &[u8],
     ) -> Option<ElfSection<'data, 'file, Elf, R>> {
         None
+    }
+
+    fn loaded_get_dynamic_section(
+        data: R,
+        program_headers: &[Elf::ProgramHeader],
+        endian: Elf::Endian,
+    ) -> read::Result<Option<&'data [<Elf as FileHeader>::Dyn]>> {
+        let dynamic_header = program_headers
+            .iter()
+            .find(|s| s.p_type(endian) == PT_DYNAMIC);
+
+        let dynamic_header = if let Some(dynamic_header) = dynamic_header {
+            dynamic_header
+        } else {
+            return Ok(None);
+        };
+
+        // We're parsing a loaded elf, have to access real values.
+        let offset = dynamic_header.p_vaddr(endian).into();
+        let size = dynamic_header.p_memsz(endian).into();
+        let count = size as usize / std::mem::size_of::<Elf::Dyn>();
+
+        let dynamic_section = data
+            .read_slice_at(offset, count)
+            .read_error("Failed to read dynamic segment")?;
+
+        Ok(Some(dynamic_section))
+    }
+
+    fn find_dyn_by_tag(dynamic: &[Elf::Dyn], tag: u32, endian: Elf::Endian) -> Option<Elf::Word> {
+        dynamic.iter().find_map(|r#dyn| {
+            let tag32 = r#dyn.tag32(endian)?;
+            if tag32 == tag {
+                Some(r#dyn.d_val(endian))
+            } else {
+                None
+            }
+        })
     }
 }
 
